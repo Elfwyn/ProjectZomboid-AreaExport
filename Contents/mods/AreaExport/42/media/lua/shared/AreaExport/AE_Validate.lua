@@ -27,9 +27,17 @@ local SUPPORTED_CLASSES = {
     IsoWindow = true,
     IsoWindowFrame = true,
     IsoCurtain = true,
-    IsoGenerator = true,
+    IsoBarbecue = true,
+    IsoCombinationWasherDryer = true,
+    IsoClothingDryer = true,
+    IsoClothingWasher = true,
+    IsoCompost = true,
+    IsoFireplace = true,
+    IsoJukebox = true,
+    IsoRadio = true,
     IsoStove = true,
-    IsoMannequin = true,
+    IsoTelevision = true,
+    IsoWaveSignal = true,
     IsoLightSwitch = true,
 }
 
@@ -91,11 +99,34 @@ local function inc(map, id, amount)
     map[id] = (map[id] or 0) + (amount or 1)
 end
 
+local function conflictMessage(kind, id)
+    if kind == "Item" then
+        return "Missing item type. Choose Replace, Skip, or Placeholder before import if you want deterministic item handling."
+    end
+    if kind == "Sprite" then
+        return "Sprite lookup warning. Use Original keeps the exported sprite name; replace or skip only when the target server really lacks this sprite."
+    end
+    if kind == "Object" and id == "IsoDoorMissingClosedSprite" then
+        return "Incomplete legacy door data. Re-export with the current version when possible; otherwise review before import."
+    end
+    if kind == "Object" then
+        return "Unsupported object class. Skip prevents the importer from rebuilding that object automatically."
+    end
+    return "Review this conflict before importing."
+end
+
+local function defaultConflictAction(kind, id, rule)
+    if rule and rule.action then return rule.action end
+    if kind == "Sprite" then return "Use Original" end
+    if kind == "Object" and DEFAULT_OBJECT_ACTIONS[id] then return DEFAULT_OBJECT_ACTIONS[id] end
+    return "Review"
+end
+
 local function addConflict(out, kind, id, count, rule, severity)
     -- The saved action shown in the list is the rule that import will apply.
     -- "Review" means no correction exists yet and the user should decide before
     -- importing if preserving that data matters.
-    local action = rule and rule.action or (kind == "Object" and DEFAULT_OBJECT_ACTIONS[id]) or "Review"
+    local action = defaultConflictAction(kind, id, rule)
     local replacement = rule and rule.replacement or nil
     out[#out + 1] = {
         kind = kind,
@@ -104,6 +135,7 @@ local function addConflict(out, kind, id, count, rule, severity)
         action = action,
         replacement = replacement,
         severity = severity or (action == "Review" and "red" or "amber"),
+        message = conflictMessage(kind, id),
     }
 end
 
@@ -130,44 +162,68 @@ local function scanItemData(itemData, stats, missingItems)
     end
 end
 
-local function scanPayload(payload, rules)
+local function newScanState(rules)
     -- This function must stay read-only. It intentionally never creates squares,
     -- objects or items, so admins can run Dry Run on a live target save without
     -- changing the map before they accept the conflict rules.
-    local stats = {
-        totalItems = 0,
-        okItems = 0,
-        missingItems = 0,
-        missingItemGroups = 0,
-        missingSprites = 0,
-        missingSpriteGroups = 0,
-        unsupportedObjects = 0,
-        unsupportedObjectGroups = 0,
+    return {
+        stats = {
+            totalItems = 0,
+            okItems = 0,
+            missingItems = 0,
+            missingItemGroups = 0,
+            missingSprites = 0,
+            missingSpriteGroups = 0,
+            unsupportedObjects = 0,
+            unsupportedObjectGroups = 0,
+            incompleteDoors = 0,
+            incompleteDoorGroups = 0,
+        },
+        missingItems = {},
+        missingSprites = {},
+        unsupportedObjects = {},
+        incompleteDoors = {},
+        rules = rules,
+        tilesScanned = 0,
     }
-    local missingItems, missingSprites, unsupportedObjects = {}, {}, {}
+end
 
-    for _, tile in ipairs(payload.tiles or {}) do
-        if tile.floor_sprite and not spriteExists(tile.floor_sprite) then
-            inc(missingSprites, tile.floor_sprite)
-        end
-        for _, obj in ipairs(tile.objects or {}) do
-            if obj.sprite and not spriteExists(obj.sprite) then
-                inc(missingSprites, obj.sprite)
-            end
-            local className = obj.class or "IsoObject"
-            if not SUPPORTED_CLASSES[className] then
-                inc(unsupportedObjects, className)
-            end
-            scanContainer(obj.container, stats, missingItems)
-        end
-        for _, itemData in ipairs(tile.worldItems or {}) do
-            scanItemData(itemData, stats, missingItems)
-        end
+local function scanTile(state, tile)
+    if type(tile) ~= "table" then return end
+    local stats = state.stats
+    state.tilesScanned = (state.tilesScanned or 0) + 1
+    if tile.floor_sprite and not spriteExists(tile.floor_sprite) then
+        inc(state.missingSprites, tile.floor_sprite)
     end
+    for _, obj in ipairs(tile.objects or {}) do
+        if obj.sprite and not spriteExists(obj.sprite) then
+            inc(state.missingSprites, obj.sprite)
+        end
+        if obj.closedSprite and not spriteExists(obj.closedSprite) then
+            inc(state.missingSprites, obj.closedSprite)
+        end
+        if obj.openSprite and not spriteExists(obj.openSprite) then
+            inc(state.missingSprites, obj.openSprite)
+        end
+        local className = obj.class or "IsoObject"
+        if not SUPPORTED_CLASSES[className] then
+            inc(state.unsupportedObjects, className)
+        end
+        if className == "IsoDoor" and obj.isOpen == true and not obj.closedSprite then
+            inc(state.incompleteDoors, "IsoDoorMissingClosedSprite")
+        end
+        scanContainer(obj.container, stats, state.missingItems)
+    end
+    for _, itemData in ipairs(tile.worldItems or {}) do
+        scanItemData(itemData, stats, state.missingItems)
+    end
+end
 
+local function finishScan(state)
+    local stats = state.stats
     local conflicts = {}
-    local ruleMap = buildRuleMap(rules)
-    for id, count in pairs(missingItems) do
+    local ruleMap = buildRuleMap(state.rules)
+    for id, count in pairs(state.missingItems) do
         stats.missingItems = stats.missingItems + count
         stats.missingItemGroups = stats.missingItemGroups + 1
         local rule = ruleMap[ruleKey("Item", id)]
@@ -181,7 +237,7 @@ local function scanPayload(payload, rules)
         end
         addConflict(conflicts, "Item", id, count, rule, severity)
     end
-    for id, count in pairs(missingSprites) do
+    for id, count in pairs(state.missingSprites) do
         stats.missingSprites = stats.missingSprites + count
         stats.missingSpriteGroups = stats.missingSpriteGroups + 1
         local rule = ruleMap[ruleKey("Sprite", id)]
@@ -189,12 +245,18 @@ local function scanPayload(payload, rules)
         if rule and rule.action == "Replace" and not spriteExists(rule.replacement) then severity = "red" end
         addConflict(conflicts, "Sprite", id, count, rule, severity)
     end
-    for id, count in pairs(unsupportedObjects) do
+    for id, count in pairs(state.unsupportedObjects) do
         stats.unsupportedObjects = stats.unsupportedObjects + count
         stats.unsupportedObjectGroups = stats.unsupportedObjectGroups + 1
         local rule = ruleMap[ruleKey("Object", id)]
         local defaultAction = DEFAULT_OBJECT_ACTIONS[id]
         addConflict(conflicts, "Object", id, count, rule, (rule and rule.action == "Skip" or defaultAction == "Skip") and "amber" or "red")
+    end
+    for id, count in pairs(state.incompleteDoors) do
+        stats.incompleteDoors = stats.incompleteDoors + count
+        stats.incompleteDoorGroups = stats.incompleteDoorGroups + 1
+        local rule = ruleMap[ruleKey("Object", id)]
+        addConflict(conflicts, "Object", id, count, rule, "red")
     end
 
     table.sort(conflicts, function(a, b)
@@ -212,8 +274,38 @@ local function scanPayload(payload, rules)
         missingSpriteGroups = stats.missingSpriteGroups,
         unsupportedObjects = stats.unsupportedObjects,
         unsupportedObjectGroups = stats.unsupportedObjectGroups,
+        incompleteDoors = stats.incompleteDoors,
+        incompleteDoorGroups = stats.incompleteDoorGroups,
         conflicts = conflicts,
+        tilesScanned = state.tilesScanned or 0,
     }
+end
+
+local function scanPayload(payload, rules)
+    local state = newScanState(rules)
+    for _, tile in ipairs(payload.tiles or {}) do
+        scanTile(state, tile)
+    end
+    return finishScan(state)
+end
+
+function AE_Validate.startPackage(rules)
+    AE_Sa.reset()
+    return newScanState(rules)
+end
+
+function AE_Validate.scanPackageLine(state, line)
+    if not state then return false, "missing validation state" end
+    if not line or line == "" then return true end
+    local tile, err = AE_Json.decode(line)
+    if not tile then return false, "tile decode failed: " .. tostring(err) end
+    scanTile(state, tile)
+    return true
+end
+
+function AE_Validate.finishPackage(state)
+    if not state then return { success = false, error = "missing validation state" } end
+    return finishScan(state)
 end
 
 function AE_Validate.runContent(content, rules)

@@ -3,13 +3,14 @@
     Tabbed admin UI for export, import, validation and help.
 
     UX decisions captured here:
-    - The mod uses a local-client copy workflow. Export streams JSON from server
-      to client and writes it into AreaExportClient/*.json, so non-technical admins
-      do not have to use manual server file access or the clipboard for
-      multi-megabyte files.
-    - Large JSON uploads back to the server are chunked and throttled over several
-      UI updates. Sending everything in one command or through Ctrl+A/C caused
-      client freezes/crashes during large-radius tests.
+    - The mod uses a local-client package workflow. Export streams tile JSON lines
+      from server to client and writes AreaExportClient/*.tiles.jsonl plus a small
+      *.manifest.json. The list UI reads only metadata, never the multi-megabyte
+      tile stream.
+    - Dry Run and Import stream package lines back to the server in bounded
+      commands. Import first uploads the complete package into a temporary server
+      buffer, then clears/rebuilds over later ticks so a failed upload does not
+      leave a half-cleared target footprint.
     - After imports with loose world items, the dialog starts a reconcile monitor
       that compares client-visible ground items with server-authoritative state and
       removes only client-side ghosts.
@@ -48,6 +49,9 @@ local IMPORT_RIGHT_TEXT_W = 450
 local VALIDATE_STATUS_W = 520
 local VALIDATE_RULE_W = 326
 local TEXT_CHUNKS_PER_UPDATE = 16
+local PACKAGE_LINES_PER_UPDATE = 25
+local PACKAGE_CHUNK_BYTE_TARGET = 4 * 1024
+local LEGACY_LARGE_FILE_LIMIT = 3 * 1024 * 1024
 
 local THEME = {
     bg = {r=0.06, g=0.07, b=0.08, a=0.94},
@@ -169,6 +173,13 @@ local function formatKb(bytes)
     return tostring(math.floor(((tonumber(bytes) or 0) + 1023) / 1024)) .. " KB"
 end
 
+local function clampPercent(value)
+    local n = tonumber(value or 0) or 0
+    if n < 0 then return 0 end
+    if n > 100 then return 100 end
+    return math.floor(n)
+end
+
 local function timestampSuffix()
     if os and os.date then
         local ok, value = pcall(function() return os.date("%Y%m%d_%H%M%S") end)
@@ -185,6 +196,45 @@ local function displayTime()
     return tostring(nowMs())
 end
 
+local function isInteractiveImportObject(obj)
+    if not obj or not instanceof then return false end
+    return instanceof(obj, "IsoCombinationWasherDryer") or
+           instanceof(obj, "IsoClothingDryer") or
+           instanceof(obj, "IsoClothingWasher") or
+           instanceof(obj, "IsoRadio") or
+           instanceof(obj, "IsoStove") or
+           instanceof(obj, "IsoTelevision") or
+           instanceof(obj, "IsoWaveSignal")
+end
+
+local function refreshClientSquareInteractions(sq)
+    if not sq then return 0 end
+    local touched = 0
+    pcall(function()
+        if sq.RecalcProperties then sq:RecalcProperties() end
+        if sq.RecalcAllWithNeighbours then sq:RecalcAllWithNeighbours(true) end
+    end)
+    local objects = sq.getObjects and sq:getObjects() or nil
+    if objects then
+        local n = objects:size()
+        for i = 0, n - 1 do
+            local obj = objects:get(i)
+            if isInteractiveImportObject(obj) then
+                touched = touched + 1
+                pcall(function()
+                    local container = obj.getContainer and obj:getContainer() or nil
+                    if container then
+                        if container.setDrawDirty then container:setDrawDirty(true) end
+                        if container.setDirty then container:setDirty(true) end
+                    end
+                    if triggerEvent then triggerEvent("OnObjectAdded", obj) end
+                end)
+            end
+        end
+    end
+    return touched
+end
+
 local function safeTransferName(name)
     if not name or name == "" then return AE_Constants.DEFAULT_FILENAME end
     local base = tostring(name)
@@ -198,6 +248,18 @@ end
 
 local function clientTransferPath(name)
     return CLIENT_TRANSFER_DIR .. safeTransferName(name) .. ".json"
+end
+
+local function clientTransferManifestPath(name)
+    return CLIENT_TRANSFER_DIR .. safeTransferName(name) .. ".manifest.json"
+end
+
+local function clientTransferTilesPath(name)
+    return CLIENT_TRANSFER_DIR .. safeTransferName(name) .. ".tiles.jsonl"
+end
+
+local function clientTransferMetaPath(name)
+    return CLIENT_TRANSFER_DIR .. safeTransferName(name) .. ".meta.json"
 end
 
 local function readClientFile(path)
@@ -258,6 +320,31 @@ local function readClientTransferFile(name)
     return readClientFile(clientTransferPath(name))
 end
 
+local normalizeExportEntry
+
+local function readClientTransferMeta(name)
+    local text = readClientFile(clientTransferManifestPath(name))
+    if not text or text == "" then
+        text = readClientFile(clientTransferMetaPath(name))
+    end
+    if not text or text == "" then return nil end
+    local decoded = AE_Json.decode(text)
+    if type(decoded) ~= "table" then return nil end
+    return normalizeExportEntry(decoded)
+end
+
+local function writeClientTransferManifest(entry)
+    entry = normalizeExportEntry(entry)
+    if not entry then return false, "invalid package manifest" end
+    return writeClientFile(clientTransferManifestPath(entry.filename), AE_Json.encode(entry))
+end
+
+local function writeClientTransferMeta(entry)
+    entry = normalizeExportEntry(entry)
+    if not entry then return false, "invalid metadata" end
+    return writeClientFile(clientTransferMetaPath(entry.filename), AE_Json.encode(entry))
+end
+
 local function parseExportMetadataFromText(content)
     -- Some early local exports did not have a complete index entry. Recover the
     -- important display fields from JSON text so old local copies still appear
@@ -292,19 +379,28 @@ local function enrichExportEntryFromContent(entry, content)
     return entry
 end
 
-local function normalizeExportEntry(entry)
+function normalizeExportEntry(entry)
     if type(entry) ~= "table" then return nil end
     local name = safeTransferName(entry.name or entry.filename or AE_Constants.DEFAULT_FILENAME)
+    local metadata = entry.metadata or {}
+    local center = metadata.center or entry.center or {}
     entry.name = name
     entry.filename = name
+    entry.formatVersion = tonumber(entry.formatVersion or entry.format_version or 1) or 1
+    entry.format_version = entry.formatVersion
+    entry.package = entry.package or entry.kind == "AreaExportPackage" or entry.formatVersion >= 2
     entry.path = clientTransferPath(name)
+    entry.manifestPath = clientTransferManifestPath(name)
+    entry.tilesPath = clientTransferTilesPath(name)
     entry.bytes = tonumber(entry.bytes or 0) or 0
     entry.tileCount = tonumber(entry.tileCount or 0) or 0
     entry.objectCount = tonumber(entry.objectCount or 0) or 0
-    entry.radius = tonumber(entry.radius or 0) or 0
-    entry.centerX = tonumber(entry.centerX or 0) or 0
-    entry.centerY = tonumber(entry.centerY or 0) or 0
-    entry.createdAt = tonumber(entry.createdAt or 0) or 0
+    entry.radius = tonumber(entry.radius or metadata.radius or 0) or 0
+    entry.centerX = tonumber(entry.centerX or center.x or 0) or 0
+    entry.centerY = tonumber(entry.centerY or center.y or 0) or 0
+    entry.metadata = metadata
+    entry.createdAt = tonumber(entry.createdAt or metadata.exported_at or 0) or 0
+    entry.kind = entry.package and "AreaExportPackage" or entry.kind
     return entry
 end
 
@@ -317,6 +413,9 @@ end
 local function readLocalExportIndex()
     -- The index is the user's export picker. It can survive multiple local test
     -- servers and makes the workflow "export here, join target, import there".
+    -- Keep this function strictly metadata-only. Current exports store their
+    -- large tile data in *.tiles.jsonl; older exports may be one giant *.json
+    -- line. Refresh/open/select must never sniff those large files.
     local entries = {}
     local text = readClientFile(CLIENT_TRANSFER_INDEX)
     if text and text ~= "" then
@@ -327,24 +426,19 @@ local function readLocalExportIndex()
                 local normalized = normalizeExportEntry(entry)
                 if normalized then
                     if (normalized.radius or 0) <= 0 or (normalized.tileCount or 0) <= 0 then
-                        local content = readClientTransferFile(normalized.filename)
-                        normalized = enrichExportEntryFromContent(normalized, content)
+                        local meta = readClientTransferMeta(normalized.filename)
+                        if meta then normalized = meta end
                     end
-                    entries[#entries + 1] = normalized
+                    -- Do not list incomplete large exports. Older builds sometimes
+                    -- produced an index entry before a valid local package/meta pair
+                    -- existed. Selecting those entries led admins into broken
+                    -- refresh/validate paths and made heap failures look like UI
+                    -- clicks. A valid export must have complete small metadata.
+                    if (normalized.radius or 0) > 0 and (normalized.tileCount or 0) > 0 then
+                        entries[#entries + 1] = normalized
+                    end
                 end
             end
-        end
-    end
-
-    if #entries == 0 then
-        local fallback = readClientTransferFile(AE_Constants.DEFAULT_FILENAME)
-        if fallback and fallback ~= "" then
-            entries[#entries + 1] = enrichExportEntryFromContent(normalizeExportEntry({
-                name = AE_Constants.DEFAULT_FILENAME,
-                filename = AE_Constants.DEFAULT_FILENAME,
-                bytes = #fallback,
-                createdAt = 0,
-            }), fallback)
         end
     end
 
@@ -371,7 +465,13 @@ local function upsertLocalExport(entry)
         end
     end
     while #nextEntries > 50 do table.remove(nextEntries) end
-    return writeLocalExportIndex(nextEntries)
+    local indexOk, indexErr = writeLocalExportIndex(nextEntries)
+    if not indexOk then return false, indexErr end
+    if entry.package then
+        writeClientTransferManifest(entry)
+    end
+    writeClientTransferMeta(entry)
+    return true
 end
 
 local function removeLocalExport(name)
@@ -394,7 +494,11 @@ local function removeLocalExport(name)
     if not ok then return false, err or "could not update export index" end
 
     local deleted, deleteErr = deleteClientFile(clientTransferPath(name))
-    return true, deleted and "deleted" or tostring(deleteErr or "removed from list")
+    local deletedMeta = deleteClientFile(clientTransferMetaPath(name))
+    local deletedManifest = deleteClientFile(clientTransferManifestPath(name))
+    local deletedTiles = deleteClientFile(clientTransferTilesPath(name))
+    local anyDeleted = deleted or deletedMeta or deletedManifest or deletedTiles
+    return true, anyDeleted and "deleted" or tostring(deleteErr or "removed from list")
 end
 
 local function parseRadiusValue(value)
@@ -407,6 +511,7 @@ local function actionColor(action)
     if action == "Skip" then return THEME.red end
     if action == "Replace" then return THEME.amber end
     if action == "Placeholder" then return THEME.blue end
+    if action == "Use Original" then return THEME.green end
     return THEME.muted
 end
 
@@ -472,8 +577,10 @@ function AE_LocalExportList:doDrawItem(y, item, alt)
     self:drawRect(8, y + 8, 8, rowH - 16, 0.95, THEME.blue.r, THEME.blue.g, THEME.blue.b)
 
     local title = truncateText(UIFont.Small, data.name or data.filename or "export", self:getWidth() - 42)
-    local detail = string.format("%s  radius %s  %d tiles",
+    local kind = data.package and "package" or "legacy"
+    local detail = string.format("%s  %s  radius %s  %d tiles",
         formatKb(data.bytes or 0),
+        kind,
         tostring(data.radius and data.radius > 0 and data.radius or "?"),
         data.tileCount or 0)
     self:drawText(title, 24, y + 6, THEME.text.r, THEME.text.g, THEME.text.b, 1, UIFont.Small)
@@ -498,13 +605,27 @@ function AE_MainDialog:new(x, y, width, height)
     o.exportResult = nil
     o.selectedConflict = nil
     o.mappingRules = {}
-    o.exportTextWriter = nil
     o.exportTextSession = nil
+    o.exportTextWriter = nil
+    o.exportTextChunks = nil
+    o.exportTextSeen = nil
+    o.exportTextNextIndex = 1
+    o.exportTextMetadataSample = ""
     o.exportTextReceived = 0
     o.exportTextBytes = 0
     o.exportTextPath = nil
+    o.exportPackageSession = nil
+    o.exportPackageWriter = nil
+    o.exportPackageChunks = nil
+    o.exportPackageSeen = nil
+    o.exportPackageNextIndex = 1
+    o.exportPackageReceived = 0
+    o.exportPackageBytes = 0
+    o.exportPackageWroteAny = false
+    o.exportPackageProgress = nil
     o.textTransfers = {}
     o.outboundTextTransfers = {}
+    o.packageTransfers = {}
     o.localExports = {}
     o.selectedExport = nil
     o.pendingExportEntry = nil
@@ -628,7 +749,7 @@ end
 
 function AE_MainDialog:createExportTab()
     self:addLabel("export", 38, 112, "Export Area", UIFont.Medium, THEME.text)
-    self:addLabel("export", 38, 142, "Export writes a local JSON on this PC.", UIFont.Small, THEME.muted)
+    self:addLabel("export", 38, 142, "Export writes a local package on this PC.", UIFont.Small, THEME.muted)
     self.pickCenterBtn = self:addButton("export", 38, 180, 132, 28, "Pick Center", AE_MainDialog.onPickCenter, "warning", "center")
     self.previewBtn = self:addButton("export", 178, 180, 108, 28, "Preview", AE_MainDialog.onPreview, nil, "preview")
 
@@ -642,17 +763,19 @@ function AE_MainDialog:createExportTab()
     self.exportBtn = self:addButton("export", 38, 356, 164, 30, "Export to This PC", AE_MainDialog.onExport, "primary", "export")
     self.statusLabel = self:addLabel("export", 38, 404, "Ready.", UIFont.Small, THEME.green)
 
-    self:addLabel("export", 434, 112, "Preview Summary", UIFont.Medium, THEME.text)
-    self:addLabel("export", 434, 142, "Preview does not change the save.", UIFont.Small, THEME.muted)
+    self:addLabel("export", 434, 112, "Preview & Local Package", UIFont.Medium, THEME.text)
+    self:addLabel("export", 434, 142, "Export streams directly to this PC.", UIFont.Small, THEME.muted)
     self.scanSquareValue = self:addLabel("export", 454, 192, "0", UIFont.Medium, THEME.text)
     self.scanObjectValue = self:addLabel("export", 584, 192, "0", UIFont.Medium, THEME.text)
     self.scanContainerValue = self:addLabel("export", 454, 276, "0", UIFont.Medium, THEME.text)
     self.scanItemValue = self:addLabel("export", 584, 276, "0", UIFont.Medium, THEME.text)
-    self.statsLabel = self:addLabel("export", 434, 352, "No preview run yet.", UIFont.Small, THEME.muted)
+    self.statsLabel = self:addLabel("export", 434, 342, "No preview run yet.", UIFont.Small, THEME.muted)
+    self.statsDetailLabel = self:addLabel("export", 434, 364, "Run Preview to estimate export contents.", UIFont.Small, THEME.muted)
 
-    self.saveLocalCopyBtn = self:addButton("export", 434, 392, 146, 30, "Save Local Copy", AE_MainDialog.onLoadExportText, nil, "save")
-    self.exportTextStatusLabel = self:addLabel("export", 434, 434, "Export first, then save locally.", UIFont.Small, THEME.muted)
-    self.exportLocalCopyHint = self:addLabel("export", 434, 462, "Large exports are saved on the server first.", UIFont.Small, THEME.muted)
+    self.saveLocalCopyBtn = self:addButton("export", 434, 392, 190, 30, "Local Save: Automatic", AE_MainDialog.onLoadExportText, nil, "save")
+    if self.saveLocalCopyBtn.setEnable then self.saveLocalCopyBtn:setEnable(false) end
+    self.exportTextStatusLabel = self:addLabel("export", 434, 434, "Export creates a local package automatically.", UIFont.Small, THEME.muted)
+    self.exportLocalCopyHint = self:addLabel("export", 434, 462, "No FTP, clipboard or server file download is needed.", UIFont.Small, THEME.muted)
     self.exportLocalCopyHint2 = self:addLabel("export", 434, 484, "Local path: Zomboid/Lua/AreaExportClient/.", UIFont.Small, THEME.muted)
 end
 
@@ -714,14 +837,17 @@ function AE_MainDialog:createValidateTab()
     self:addLabel("validate", 584, 104, "Selected Rule", UIFont.Medium, THEME.text)
     self.selectedConflictLabel = self:addLabel("validate", 584, 136, "No conflict selected", UIFont.Small, THEME.text)
     self.selectedActionLabel = self:addLabel("validate", 584, 156, "Run Dry Run first.", UIFont.Small, THEME.muted)
-    self.addActionSkip = self:addButton("validate", 584, 176, 84, 26, "Skip", AE_MainDialog.onMappingAction, "danger", "skip")
-    self.addActionReplace = self:addButton("validate", 678, 176, 124, 26, "Replace", AE_MainDialog.onMappingAction, "warning", "replace")
+    self.addActionSkip = self:addButton("validate", 584, 176, 74, 26, "Skip", AE_MainDialog.onMappingAction, "danger", "skip")
+    self.addActionReplace = self:addButton("validate", 666, 176, 104, 26, "Replace", AE_MainDialog.onMappingAction, "warning", "replace")
+    self.addActionOriginal = self:addButton("validate", 778, 176, 132, 26, "Use Original", AE_MainDialog.onMappingAction, nil, "file")
     self.addActionPlaceholder = self:addButton("validate", 584, 210, 326, 26, "Keep Placeholder", AE_MainDialog.onMappingAction, nil, "file")
     self.addActionSkip.ruleAction = "Skip"
     self.addActionReplace.ruleAction = "Replace"
+    self.addActionOriginal.ruleAction = "Use Original"
     self.addActionPlaceholder.ruleAction = "Placeholder"
+    self.selectedReasonLabel = self:addLabel("validate", 584, 242, "Details appear after Dry Run.", UIFont.Small, THEME.muted)
 
-    self:addLabel("validate", 584, 262, "Replacement Search", UIFont.Small, THEME.muted)
+    self:addLabel("validate", 584, 266, "Replacement Search", UIFont.Small, THEME.muted)
     self.replacementSearchBox = self:addEntry("validate", 584, 284, 202, 26, "vhs", false)
     self.searchItemsBtn = self:addButton("validate", 796, 284, 114, 26, "Search", AE_MainDialog.onSearchItems, nil, nil)
     self.replacementList = AE_ReplacementList:new(584, 320, 326, 174)
@@ -792,11 +918,18 @@ function AE_MainDialog:createHelpTab()
     local leftW, rightW = 350, 350
 
     local leftY = 88
+    leftY = addSection(leftX, leftY, "Alpha Warning", {
+        "Area Export is a first public alpha version and can still contain bugs.",
+        "It can change or damage world data if an import hits an unsupported Project Zomboid object state.",
+        "Always back up the target save and test migrations on a local or disposable server before using a live server.",
+    }, leftW)
+
+    leftY = leftY + 16
     leftY = addSection(leftX, leftY, "Export", {
         "1. Click Pick Center and then click the tile that should be the exact middle of the exported area.",
         "2. Enter the radius. The radius is stored in the export and will be used again during import.",
-        "3. Click Preview to draw the footprint and count squares, objects, containers and items. Preview does not change the save.",
-        "4. Enter a name prefix and click Export. The JSON is saved on this PC with a timestamp.",
+        "3. Click Preview to draw the footprint and count map tiles, map objects, containers, container items and loose floor items. Preview does not change the save.",
+        "4. Enter a name prefix and click Export. A local package is saved on this PC with a timestamp.",
         "5. Every successful export is added to Local Exports in the Import tab.",
     }, leftW)
 
@@ -805,25 +938,36 @@ function AE_MainDialog:createHelpTab()
         "Select one entry from Local Exports.",
         "Validate checks that selected local export without changing the save.",
         "Import restores the selected local export at the original world coordinates and uses the original export radius. You do not pick a new center.",
+        "Package import progress has separate phases for client upload, target footprint clearing, and server tile rebuild.",
+        "During clearing, linked double-door and garage-door tiles are removed as one group so partial door objects do not survive at footprint edges.",
+        "Interactive vanilla fixtures are rebuilt with their real object classes when known: TV, radio, stove, microwave, washer, dryer, BBQ, fireplace, jukebox and composter.",
+        "Older packages can still recover many of those classes from sprite IsoType or container type during import.",
+        "B42 live imports use targeted entity/component setup for stoves, laundry machines, TVs and radios, while TV/radio DeviceData is restored after object initialization.",
+        "After updating the mod on a dedicated server, restart the server process before testing an import; a client reconnect does not reload server-side Lua.",
+        "Door live sync avoids generic sync packets because B42 can reject freshly rebuilt door indexes; garage doors are restored as closed linked groups.",
+        "State-heavy objects such as generators, mannequins and feeding troughs are shown as Dry Run object conflicts until their full state can be mapped.",
         "Import is destructive inside the exported footprint. Back up the target save before using it on a real server.",
     }, leftW)
 
     leftY = leftY + 16
     leftY = addSection(leftX, leftY, "Local Export List", {
         "The list is stored in Zomboid/Lua/AreaExportClient/index.json.",
-        "Each export JSON is stored beside it using the export name.",
-        "Refresh reloads the list. Delete removes the selected entry from the list and tries to delete the JSON file.",
-        "To move an export to another PC, copy the JSON file and index file into the same AreaExportClient folder on the target PC.",
+        "Each current export has a small manifest file and a tiles JSONL file beside the index.",
+        "Refresh reloads only the index/manifest metadata. It does not read the large tile file.",
+        "Delete removes the selected entry from the list and tries to delete its manifest, tile file and legacy JSON file.",
+        "To move an export to another PC, copy index.json plus the selected .manifest.json and .tiles.jsonl files into the same AreaExportClient folder on the target PC.",
     }, leftW)
 
     local rightY = 88
-    rightY = addSection(rightX, rightY, "Item Correction", {
-        "Dry Run reads the JSON before import and does not change the save.",
+    rightY = addSection(rightX, rightY, "Conflict Resolution", {
+        "Dry Run streams the selected package before import and does not change the save.",
+        "Conflicts are grouped by type: missing items, sprite lookup warnings, unsupported object classes, and incomplete legacy door data.",
         "Missing or renamed item types are grouped by their old item ID, so one decision applies to all matching items.",
         "Replace maps every item of the missing type to a selected existing type.",
         "Skip drops every item of that missing type during import.",
         "Placeholder keeps a marker item so the conflict stays visible after import.",
-        "Save Rules stages those decisions for the next import in this dialog session. Import applies the rules to every matching item.",
+        "Sprite warnings default to Use Original. Keep that when source and target use the same mods; replace or skip only if the target really lacks that sprite.",
+        "Save Rules stages explicit decisions for the next import in this dialog session. Use Original clears a saved sprite rule and preserves the exported sprite name.",
     }, rightW)
 
     rightY = rightY + 16
@@ -831,6 +975,22 @@ function AE_MainDialog:createHelpTab()
         "The mod automatically compares imported loose floor-item squares against the server for a short time.",
         "If the server says an item is gone but the client still shows a local ghost, that local ghost is removed automatically.",
         "Project Zomboid may still not redraw every changed chunk immediately. If walls or furniture look stale, reconnect or restart the client.",
+    }, rightW)
+
+    rightY = rightY + 16
+    rightY = addSection(rightX, rightY, "Memory And Large Exports", {
+        "Export, Dry Run and Import use small transfer parts instead of one giant JSON string.",
+        "Export progress shows scanned map positions out of the known footprint, transfer parts received by the client and saved package tiles.",
+        "Dry Run progress shows package tiles checked by the server while the client uploads the package.",
+        "The Import button uploads the whole package into a temporary server buffer first. Only after that upload succeeds does the server clear and rebuild the target footprint over multiple ticks. The progress bar resets for each phase.",
+        "Very large areas can still take time and may briefly stall while individual tiles with many objects or items are processed.",
+        "Old legacy JSON exports above the safety limit are refused by the UI. Re-export them with the current package format.",
+    }, rightW)
+
+    rightY = rightY + 16
+    rightY = addSection(rightX, rightY, "Open Source", {
+        "Source code: https://github.com/Elfwyn/ProjectZomboid-AreaExport/",
+        "Using the public code for your own mods, forks, variants or compatibility patches is explicitly allowed and encouraged.",
     }, rightW)
 
     rightY = rightY + 16
@@ -877,6 +1037,14 @@ function AE_MainDialog:drawMetricCard(x, y, w, h, label, color)
     self:drawText(label, x + 14, y + 42, THEME.muted.r, THEME.muted.g, THEME.muted.b, 1, UIFont.Small)
 end
 
+function AE_MainDialog:drawProgressBar(x, y, w, h, percent, color)
+    percent = clampPercent(percent)
+    color = color or THEME.green
+    self:drawRect(x, y, w, h, 0.85, 0.045, 0.05, 0.055)
+    self:drawRect(x, y, math.floor(w * percent / 100), h, 0.90, color.r, color.g, color.b)
+    self:drawRectBorder(x, y, w, h, 0.55, THEME.border.r, THEME.border.g, THEME.border.b)
+end
+
 function AE_MainDialog:drawValidateBadge(x, y, w, label, color)
     self:drawRect(x, y, w, 66, THEME.panel2.a, THEME.panel2.r, THEME.panel2.g, THEME.panel2.b)
     self:drawRectBorder(x, y, w, 66, 0.45, color.r, color.g, color.b)
@@ -892,13 +1060,20 @@ function AE_MainDialog:prerender()
     if self.activeTab == "export" then
         self:drawPanel(24, 88, 346, 378)
         self:drawPanel(414, 88, 400, 458)
-        self:drawMetricCard(434, 176, 120, 72, "Squares", THEME.green)
-        self:drawMetricCard(564, 176, 120, 72, "Objects", THEME.blue)
+        self:drawMetricCard(434, 176, 120, 72, "Map tiles", THEME.green)
+        self:drawMetricCard(564, 176, 120, 72, "Map objects", THEME.blue)
         self:drawMetricCard(434, 260, 120, 72, "Containers", THEME.amber)
-        self:drawMetricCard(564, 260, 120, 72, "Items", THEME.green)
+        self:drawMetricCard(564, 260, 120, 72, "Container items", THEME.green)
+        if self.exportPackageProgress then
+            self:drawProgressBar(434, 516, 360, 14, self.exportPackageProgress.percent or 0, THEME.green)
+        end
     elseif self.activeTab == "import" then
         self:drawPanel(24, 88, 430, 458)
         self:drawPanel(464, 88, 482, 458)
+        local importTransfer = self.packageTransfers and self.packageTransfers.importPackage
+        if importTransfer then
+            self:drawProgressBar(474, 248, 450, 14, self:getPackageTransferPercent("importPackage"), THEME.blue)
+        end
         self:drawMetricCard(474, 466, 126, 64, "Items", THEME.green)
         self:drawMetricCard(610, 466, 126, 64, "Squares", THEME.blue)
         self:drawMetricCard(746, 466, 96, 64, "Failed", THEME.red)
@@ -908,13 +1083,17 @@ function AE_MainDialog:prerender()
         self:drawPanel(566, 84, 370, 430)
         self:drawValidateBadge(38, 182, 118, "OK items", THEME.green)
         self:drawValidateBadge(170, 182, 118, "Missing items", THEME.amber)
-        self:drawValidateBadge(302, 182, 118, "Missing sprites", THEME.amber)
+        self:drawValidateBadge(302, 182, 118, "Sprite warnings", THEME.amber)
         self:drawValidateBadge(434, 182, 94, "Objects", THEME.red)
         self:drawRect(38, 280, 500, 24, 0.85, 0.05, 0.055, 0.06)
         self:drawText("Type", 62, 286, THEME.muted.r, THEME.muted.g, THEME.muted.b, 1, UIFont.Small)
-        self:drawText("Missing ID", 132, 286, THEME.muted.r, THEME.muted.g, THEME.muted.b, 1, UIFont.Small)
+        self:drawText("Conflict ID", 132, 286, THEME.muted.r, THEME.muted.g, THEME.muted.b, 1, UIFont.Small)
         self:drawTextRight("Count", 428, 286, THEME.muted.r, THEME.muted.g, THEME.muted.b, 1, UIFont.Small)
         self:drawText("Action", 452, 286, THEME.muted.r, THEME.muted.g, THEME.muted.b, 1, UIFont.Small)
+        local validateTransfer = self.packageTransfers and self.packageTransfers.validatePackage
+        if validateTransfer then
+            self:drawProgressBar(38, 518, 500, 10, self:getPackageTransferPercent("validatePackage"), THEME.amber)
+        end
     elseif self.activeTab == "help" then
         self:drawPanel(24, 88, 850, 458)
     end
@@ -962,16 +1141,18 @@ function AE_MainDialog:updateSelectedExportLabels()
     end
 
     local objectText = selected.objectCount and selected.objectCount > 0 and (", " .. tostring(selected.objectCount) .. " objects") or ""
-    local detail = string.format("%s, radius %s, center %d/%d, %d tiles%s",
+    local kind = selected.package and "package" or "legacy JSON"
+    local detail = string.format("%s, %s, radius %s, center %d/%d, %d tiles%s",
         formatKb(selected.bytes or 0),
+        kind,
         tostring(selected.radius and selected.radius > 0 and selected.radius or "?"),
         selected.centerX or 0,
         selected.centerY or 0,
         selected.tileCount or 0,
         objectText)
-    setClippedLabel(self.selectedExportLabel, selected.filename .. ".json", IMPORT_RIGHT_TEXT_W, UIFont.Small)
+    setClippedLabel(self.selectedExportLabel, selected.filename .. (selected.package and ".manifest.json" or ".json"), IMPORT_RIGHT_TEXT_W, UIFont.Small)
     setClippedLabel(self.selectedExportDetailLabel, detail, IMPORT_RIGHT_TEXT_W, UIFont.Small)
-    setClippedLabel(self.validateFileLabel, "Selected export: " .. selected.filename .. ".json", VALIDATE_STATUS_W, UIFont.Small)
+    setClippedLabel(self.validateFileLabel, "Selected export: " .. selected.filename .. (selected.package and " package" or ".json"), VALIDATE_STATUS_W, UIFont.Small)
 end
 
 function AE_MainDialog:refreshLocalExports(preferredName)
@@ -1052,8 +1233,8 @@ function AE_MainDialog:update()
     else
         setClippedLabel(self.centerLabel, "Center: (none)", EXPORT_LEFT_TEXT_W, UIFont.Small)
     end
-    self:updateSelectedExportLabels()
     self:processOutboundTransfers()
+    self:processPackageTransfers()
     self:updateActiveTransfers()
     self:processWorldItemMonitor()
 end
@@ -1068,8 +1249,12 @@ function AE_MainDialog:setScanResult(r)
     self.scanObjectValue:setName(tostring(r.objectCount or 0))
     self.scanContainerValue:setName(tostring(r.containerCount or 0))
     self.scanItemValue:setName(tostring(r.totalItemsInContainers or 0))
-    setClippedLabel(self.statsLabel, string.format("World items: %d  Player-built: %d",
+    local containerItems = tonumber(r.totalItemsInContainers or 0) or 0
+    local worldItems = tonumber(r.worldItemCount or 0) or 0
+    setClippedLabel(self.statsLabel, string.format("Loose floor items: %d  Player-built map objects: %d",
         r.worldItemCount or 0, r.playerBuildCount or 0), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+    setClippedLabel(self.statsDetailLabel, string.format("Total item records: %d (%d container + %d loose floor).",
+        containerItems + worldItems, containerItems, worldItems), EXPORT_RIGHT_TEXT_W, UIFont.Small)
 end
 
 function AE_MainDialog:setExportResult(r)
@@ -1084,13 +1269,41 @@ function AE_MainDialog:setExportResult(r)
     setClippedLabel(self.statusLabel, string.format("Exported %d tiles, %d objects, %d bytes.",
         r.tileCount or 0, r.objectCount or 0, r.bytes or 0), EXPORT_LEFT_TEXT_W, UIFont.Small)
     if self.exportTextStatusLabel then
-        setClippedLabel(self.exportTextStatusLabel, "Server export saved. Click Save Local Copy.", EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        setClippedLabel(self.exportTextStatusLabel, "Legacy server export finished.", EXPORT_RIGHT_TEXT_W, UIFont.Small)
     end
+end
+
+function AE_MainDialog:refreshImportInteractionState(r)
+    local player = getPlayer and getPlayer() or nil
+    local cell = getCell and getCell() or nil
+    if not player or not cell then return 0 end
+    local px = math.floor(player:getX())
+    local py = math.floor(player:getY())
+    local pz = math.floor(player:getZ())
+    local radius = tonumber(r and r.radius or 0) or 0
+    local scanRadius = math.min(math.max(radius, 24), 48)
+    local touched = 0
+    local r2 = scanRadius * scanRadius
+    for dy = -scanRadius, scanRadius do
+        for dx = -scanRadius, scanRadius do
+            if dx * dx + dy * dy <= r2 then
+                for z = math.max(0, pz - 1), math.min(7, pz + 1) do
+                    local sq = cell:getGridSquare(px + dx, py + dy, z)
+                    if sq then touched = touched + refreshClientSquareInteractions(sq) end
+                end
+            end
+        end
+    end
+    pcall(function()
+        if triggerEvent then triggerEvent("OnContainerUpdate") end
+    end)
+    return touched
 end
 
 function AE_MainDialog:setImportResult(r)
     self.importResult = r
     self:finishTextTransfer("importText")
+    self:finishPackageTransfer("importPackage")
     if not r.success then
         setClippedLabel(self.importStatusLabel, "Import failed: " .. tostring(r.error or "unknown"), IMPORT_LEFT_TEXT_W, UIFont.Small)
         return
@@ -1101,9 +1314,12 @@ function AE_MainDialog:setImportResult(r)
     self.missingContainersValue:setName(tostring(r.containersMissing or 0))
     local importName = self.currentImportName or self:getImportFilename()
     setClippedLabel(self.lastImportTitleLabel, "Last Import: " .. tostring(importName), IMPORT_RIGHT_TEXT_W, UIFont.Small)
+    local refreshed = self:refreshImportInteractionState(r)
     local monitored = self:startWorldItemMonitor(r)
     if monitored > 0 then
         setClippedLabel(self.importStatusLabel, string.format("Import completed. Reconcile checks %d item square(s).", monitored), IMPORT_LEFT_TEXT_W, UIFont.Small)
+    elseif refreshed > 0 then
+        setClippedLabel(self.importStatusLabel, string.format("Import completed. Refreshed %d interactive object(s).", refreshed), IMPORT_LEFT_TEXT_W, UIFont.Small)
     else
         setClippedLabel(self.importStatusLabel, "Import completed. Reconnect to verify.", IMPORT_LEFT_TEXT_W, UIFont.Small)
     end
@@ -1113,6 +1329,7 @@ end
 
 function AE_MainDialog:setValidationResult(r)
     self:finishTextTransfer("validateText")
+    self:finishPackageTransfer("validatePackage")
     if not r.success then
         setClippedLabel(self.validateStatusLabel, "Dry Run failed: " .. tostring(r.error or "unknown"), VALIDATE_STATUS_W, UIFont.Small)
         return
@@ -1145,6 +1362,7 @@ function AE_MainDialog:setValidationResult(r)
         self.selectedConflict = nil
         setClippedLabel(self.selectedConflictLabel, "No conflicts found", VALIDATE_RULE_W, UIFont.Small)
         setClippedLabel(self.selectedActionLabel, "Import can use the original data.", VALIDATE_RULE_W, UIFont.Small)
+        setClippedLabel(self.selectedReasonLabel, "No correction rules are needed.", VALIDATE_RULE_W, UIFont.Small)
         self:updateRuleButtons("Review")
         setClippedLabel(self.validateStatusLabel, "Dry Run complete. No grouped conflicts found.", VALIDATE_STATUS_W, UIFont.Small)
     end
@@ -1171,56 +1389,97 @@ end
 
 function AE_MainDialog:startExportText(r)
     if not r.success then
+        if self.exportTextWriter then pcall(function() self.exportTextWriter:close() end) end
         self.exportTextWriter = nil
+        self.exportTextChunks = nil
+        self.exportTextSeen = nil
         setClippedLabel(self.exportTextStatusLabel, "Export failed: " .. tostring(r.error or "unknown"), EXPORT_RIGHT_TEXT_W, UIFont.Small)
         setClippedLabel(self.statusLabel, "Export failed: " .. tostring(r.error or "unknown"), EXPORT_LEFT_TEXT_W, UIFont.Small)
         return
     end
-    if self.exportTextWriter then
-        pcall(function() self.exportTextWriter:close() end)
-        self.exportTextWriter = nil
-    end
 
+    if self.exportTextWriter then pcall(function() self.exportTextWriter:close() end) end
     self.exportTextSession = r.sessionId
-    self.exportTextPath = clientTransferPath(r.filename or self:getExportFilename())
+    local filename = safeTransferName(r.filename or self:getExportFilename())
+    self.exportTextPath = clientTransferPath(filename)
     self.exportTextExpected = tonumber(r.totalChunks or 0) or 0
+    self.exportTextChunks = {}
+    self.exportTextSeen = {}
+    self.exportTextNextIndex = 1
+    self.exportTextMetadataSample = ""
     self.exportTextReceived = 0
     self.exportTextBytes = 0
+    local exportResult = self.exportResult or {}
+    local exportMetadata = r.metadata or exportResult.metadata
     self.pendingExportEntry = {
-        filename = safeTransferName(r.filename or self:getExportFilename()),
-        bytes = tonumber(r.bytes or 0) or 0,
-        tileCount = tonumber(r.tileCount or 0) or 0,
-        objectCount = tonumber(r.objectCount or 0) or 0,
-        metadata = r.metadata,
+        filename = filename,
+        bytes = tonumber(r.bytes or exportResult.bytes or 0) or 0,
+        tileCount = tonumber(r.tileCount or exportResult.tileCount or 0) or 0,
+        objectCount = tonumber(r.objectCount or exportResult.objectCount or 0) or 0,
+        metadata = exportMetadata,
     }
+
     local ok, writerOrErr = pcall(function()
         return getFileWriter(self.exportTextPath, true, false)
     end)
     if not ok or not writerOrErr then
-        setClippedLabel(self.exportTextStatusLabel, "Could not write local export.", EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        self.exportTextChunks = nil
+        self.exportTextSeen = nil
         self.exportTextWriter = nil
+        setClippedLabel(self.exportTextStatusLabel, "Could not write local export.", EXPORT_RIGHT_TEXT_W, UIFont.Small)
         return
     end
     self.exportTextWriter = writerOrErr
-    setClippedLabel(self.exportTextStatusLabel, string.format("Saving %d chunks to this PC...", self.exportTextExpected), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+    setClippedLabel(self.exportTextStatusLabel, string.format("Receiving %d chunks from source server...", self.exportTextExpected), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+end
+
+function AE_MainDialog:flushExportTextChunks()
+    if not self.exportTextWriter or not self.exportTextChunks then return true end
+    while self.exportTextChunks[self.exportTextNextIndex or 1] ~= nil do
+        local index = self.exportTextNextIndex or 1
+        local chunk = self.exportTextChunks[index]
+        self.exportTextChunks[index] = nil
+        local ok = pcall(function() self.exportTextWriter:write(chunk) end)
+        if not ok then
+            pcall(function() self.exportTextWriter:close() end)
+            self.exportTextWriter = nil
+            self.exportTextChunks = nil
+            self.exportTextSeen = nil
+            setClippedLabel(self.exportTextStatusLabel, "Local export write failed.", EXPORT_RIGHT_TEXT_W, UIFont.Small)
+            return false
+        end
+        self.exportTextNextIndex = index + 1
+    end
+    return true
 end
 
 function AE_MainDialog:addExportTextChunk(r)
-    if not self.exportTextWriter or r.sessionId ~= self.exportTextSession then return end
-    local chunk = tostring(r.chunk or "")
-    local ok = pcall(function()
-        self.exportTextWriter:write(chunk)
-    end)
-    if ok then
-        self.exportTextReceived = (self.exportTextReceived or 0) + 1
-        self.exportTextBytes = (self.exportTextBytes or 0) + #chunk
-        if self.exportTextStatusLabel and self.exportTextReceived % 10 == 0 then
-            setClippedLabel(self.exportTextStatusLabel, string.format("Saved %d / %d chunks...", self.exportTextReceived, self.exportTextExpected or 0), EXPORT_RIGHT_TEXT_W, UIFont.Small)
-        end
-    else
+    if not self.exportTextWriter or not self.exportTextChunks or r.sessionId ~= self.exportTextSession then return end
+    local index = tonumber(r.index or 0) or 0
+    if index < 1 or (self.exportTextExpected and index > self.exportTextExpected) then
+        setClippedLabel(self.exportTextStatusLabel, "Local export download failed: invalid chunk index.", EXPORT_RIGHT_TEXT_W, UIFont.Small)
         pcall(function() self.exportTextWriter:close() end)
         self.exportTextWriter = nil
-        setClippedLabel(self.exportTextStatusLabel, "Local export write failed.", EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        self.exportTextChunks = nil
+        self.exportTextSeen = nil
+        return
+    end
+    local chunk = tostring(r.chunk or "")
+    if not self.exportTextSeen[index] then
+        self.exportTextSeen[index] = true
+        self.exportTextReceived = (self.exportTextReceived or 0) + 1
+        self.exportTextBytes = (self.exportTextBytes or 0) + #chunk
+        if #(self.exportTextMetadataSample or "") < 65536 then
+            self.exportTextMetadataSample = (self.exportTextMetadataSample or "") .. chunk
+            if #self.exportTextMetadataSample > 65536 then
+                self.exportTextMetadataSample = string.sub(self.exportTextMetadataSample, 1, 65536)
+            end
+        end
+        self.exportTextChunks[index] = chunk
+        if not self:flushExportTextChunks() then return end
+        if self.exportTextStatusLabel and self.exportTextReceived % 10 == 0 then
+            setClippedLabel(self.exportTextStatusLabel, string.format("Received %d / %d chunks...", self.exportTextReceived, self.exportTextExpected or 0), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        end
     end
 end
 
@@ -1230,21 +1489,45 @@ function AE_MainDialog:finishExportText(r)
         setClippedLabel(self.statusLabel, "Export failed.", EXPORT_LEFT_TEXT_W, UIFont.Small)
         return
     end
-    if not self.exportTextWriter or r.sessionId ~= self.exportTextSession then return end
-    local ok, err = pcall(function() self.exportTextWriter:close() end)
-    self.exportTextWriter = nil
+    if not self.exportTextWriter or not self.exportTextChunks or r.sessionId ~= self.exportTextSession then return end
     if self.exportTextStatusLabel then
+        local expected = tonumber(r.totalChunks or self.exportTextExpected or 0) or 0
+        if self.exportTextReceived ~= expected or (self.exportTextNextIndex or 1) ~= expected + 1 then
+            local missing = self.exportTextNextIndex or (self.exportTextReceived + 1)
+            pcall(function() self.exportTextWriter:close() end)
+            self.exportTextWriter = nil
+            self.exportTextChunks = nil
+            self.exportTextSeen = nil
+            self.pendingExportEntry = nil
+            setClippedLabel(self.exportTextStatusLabel, "Local export incomplete: missing chunk " .. tostring(missing) .. ".", EXPORT_RIGHT_TEXT_W, UIFont.Small)
+            return
+        end
+
+        local expectedBytes = tonumber(r.bytes or 0) or 0
+        if expectedBytes > 0 and self.exportTextBytes ~= expectedBytes then
+            pcall(function() self.exportTextWriter:close() end)
+            self.exportTextWriter = nil
+            self.exportTextChunks = nil
+            self.exportTextSeen = nil
+            self.pendingExportEntry = nil
+            setClippedLabel(self.exportTextStatusLabel, string.format("Local export incomplete: %d/%d bytes.", self.exportTextBytes, expectedBytes), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+            return
+        end
+
+        local ok, err = pcall(function() self.exportTextWriter:close() end)
+        self.exportTextWriter = nil
         if ok then
             local pending = self.pendingExportEntry or {}
-            local metadata = r.metadata or pending.metadata or {}
-            local center = metadata.center or {}
+            local metadata = r.metadata or pending.metadata or parseExportMetadataFromText(self.exportTextMetadataSample or "")
+            local center = metadata.center or { x = metadata.centerX, y = metadata.centerY }
             local filename = safeTransferName(r.filename or pending.filename or self:getExportFilename())
+            local exportResult = self.exportResult or {}
             local entry = {
                 name = filename,
                 filename = filename,
-                bytes = tonumber(r.bytes or pending.bytes or self.exportTextBytes or 0) or 0,
-                tileCount = tonumber(r.tileCount or pending.tileCount or 0) or 0,
-                objectCount = tonumber(r.objectCount or pending.objectCount or 0) or 0,
+                bytes = tonumber(r.bytes or pending.bytes or exportResult.bytes or self.exportTextBytes or 0) or 0,
+                tileCount = tonumber(r.tileCount or pending.tileCount or exportResult.tileCount or metadata.tileCount or 0) or 0,
+                objectCount = tonumber(r.objectCount or pending.objectCount or exportResult.objectCount or 0) or 0,
                 radius = tonumber(metadata.radius or 0) or 0,
                 centerX = tonumber(center.x or 0) or 0,
                 centerY = tonumber(center.y or 0) or 0,
@@ -1263,7 +1546,206 @@ function AE_MainDialog:finishExportText(r)
             setClippedLabel(self.exportTextStatusLabel, "Local export close failed: " .. tostring(err), EXPORT_RIGHT_TEXT_W, UIFont.Small)
         end
     end
+    self.exportTextWriter = nil
+    self.exportTextChunks = nil
+    self.exportTextSeen = nil
+    self.exportTextMetadataSample = ""
     self.pendingExportEntry = nil
+end
+
+function AE_MainDialog:resetExportPackageState()
+    if self.exportPackageWriter then pcall(function() self.exportPackageWriter:close() end) end
+    self.exportPackageSession = nil
+    self.exportPackageWriter = nil
+    self.exportPackageChunks = nil
+    self.exportPackageSeen = nil
+    self.exportPackageNextIndex = 1
+    self.exportPackageReceived = 0
+    self.exportPackageBytes = 0
+    self.exportPackageWroteAny = false
+    self.exportPackageProgress = nil
+    self.pendingExportEntry = nil
+end
+
+function AE_MainDialog:startExportPackage(r)
+    if not r.success then
+        self:resetExportPackageState()
+        setClippedLabel(self.exportTextStatusLabel, "Export failed: " .. tostring(r.error or "unknown"), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        setClippedLabel(self.statusLabel, "Export failed.", EXPORT_LEFT_TEXT_W, UIFont.Small)
+        return
+    end
+
+    self:resetExportPackageState()
+    local filename = safeTransferName(r.filename or self.pendingLocalExportName or self:getExportFilename())
+    self.exportPackageSession = r.sessionId
+    self.exportPackageChunks = {}
+    self.exportPackageSeen = {}
+    self.exportPackageNextIndex = 1
+    self.exportPackageReceived = 0
+    self.exportPackageBytes = 0
+    self.exportPackageWroteAny = false
+    self.exportPackageProgress = {
+        visited = tonumber(r.visitedPositions or 0) or 0,
+        total = tonumber(r.totalPositions or 0) or 0,
+        percent = clampPercent(r.progressPercent or 0),
+        tileCount = 0,
+        transferParts = 0,
+    }
+    self.pendingExportEntry = {
+        filename = filename,
+        metadata = r.metadata,
+        formatVersion = tonumber(r.format_version or 2) or 2,
+        package = true,
+    }
+
+    local ok, writerOrErr = pcall(function()
+        return getFileWriter(clientTransferTilesPath(filename), true, false)
+    end)
+    if not ok or not writerOrErr then
+        self:resetExportPackageState()
+        setClippedLabel(self.exportTextStatusLabel, "Could not open package tile file.", EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        setClippedLabel(self.statusLabel, "Export could not start local save.", EXPORT_LEFT_TEXT_W, UIFont.Small)
+        return
+    end
+    self.exportPackageWriter = writerOrErr
+    setClippedLabel(self.exportTextStatusLabel, string.format("Export scan: 0/%d map positions, 0 transfer parts.",
+        self.exportPackageProgress.total or 0), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+    setClippedLabel(self.statusLabel, "Streaming export package...", EXPORT_LEFT_TEXT_W, UIFont.Small)
+end
+
+function AE_MainDialog:updateExportPackageProgress(r)
+    if r and r.sessionId and self.exportPackageSession and r.sessionId ~= self.exportPackageSession then return end
+    local total = tonumber(r and r.totalPositions or (self.exportPackageProgress and self.exportPackageProgress.total) or 0) or 0
+    local visited = tonumber(r and r.visitedPositions or (self.exportPackageProgress and self.exportPackageProgress.visited) or 0) or 0
+    local percent = clampPercent(r and r.progressPercent or (total > 0 and (visited * 100 / total) or 0))
+    local transferParts = tonumber(r and (r.transferParts or r.index) or self.exportPackageReceived or 0) or 0
+    local tileCount = tonumber(r and r.tileCount or (self.exportPackageProgress and self.exportPackageProgress.tileCount) or 0) or 0
+    self.exportPackageProgress = {
+        visited = visited,
+        total = total,
+        percent = percent,
+        transferParts = transferParts,
+        tileCount = tileCount,
+    }
+    setClippedLabel(self.exportTextStatusLabel,
+        string.format("Export scan: %d/%d map positions (%d%%), %d transfer parts, %d saved tiles.",
+            visited, total, percent, transferParts, tileCount),
+        EXPORT_RIGHT_TEXT_W, UIFont.Small)
+end
+
+function AE_MainDialog:flushExportPackageChunks()
+    if not self.exportPackageWriter or not self.exportPackageChunks then return true end
+    while self.exportPackageChunks[self.exportPackageNextIndex or 1] ~= nil do
+        local index = self.exportPackageNextIndex or 1
+        local chunk = self.exportPackageChunks[index]
+        self.exportPackageChunks[index] = nil
+        local ok = pcall(function()
+            self.exportPackageWriter:write(chunk)
+        end)
+        if not ok then
+            self:resetExportPackageState()
+            setClippedLabel(self.exportTextStatusLabel, "Local package write failed.", EXPORT_RIGHT_TEXT_W, UIFont.Small)
+            setClippedLabel(self.statusLabel, "Export failed while saving locally.", EXPORT_LEFT_TEXT_W, UIFont.Small)
+            return false
+        end
+        self.exportPackageWroteAny = true
+        self.exportPackageNextIndex = index + 1
+    end
+    return true
+end
+
+function AE_MainDialog:addExportPackageChunk(r)
+    if not self.exportPackageWriter or not self.exportPackageChunks or r.sessionId ~= self.exportPackageSession then return end
+    if not r.success then
+        self:resetExportPackageState()
+        setClippedLabel(self.exportTextStatusLabel, "Export stream failed: " .. tostring(r.error or "unknown"), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        setClippedLabel(self.statusLabel, "Export failed.", EXPORT_LEFT_TEXT_W, UIFont.Small)
+        return
+    end
+    local index = tonumber(r.index or 0) or 0
+    if index < 1 then
+        self:resetExportPackageState()
+        setClippedLabel(self.exportTextStatusLabel, "Export stream failed: invalid chunk index.", EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        return
+    end
+    if not self.exportPackageSeen[index] then
+        self.exportPackageSeen[index] = true
+        self.exportPackageChunks[index] = tostring(r.chunk or "")
+        self.exportPackageReceived = (self.exportPackageReceived or 0) + 1
+        self.exportPackageBytes = tonumber(r.bytes or self.exportPackageBytes or 0) or 0
+        if not self:flushExportPackageChunks() then return end
+        self:updateExportPackageProgress(r)
+    end
+end
+
+function AE_MainDialog:finishExportPackage(r)
+    if not r.success then
+        self:resetExportPackageState()
+        setClippedLabel(self.exportTextStatusLabel, "Export failed: " .. tostring(r.error or "unknown"), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        setClippedLabel(self.statusLabel, "Export failed.", EXPORT_LEFT_TEXT_W, UIFont.Small)
+        return
+    end
+    if not self.exportPackageWriter or r.sessionId ~= self.exportPackageSession then return end
+    if not self:flushExportPackageChunks() then return end
+
+    local expected = tonumber(r.totalChunks or self.exportPackageReceived or 0) or 0
+    if self.exportPackageReceived ~= expected or (self.exportPackageNextIndex or 1) ~= expected + 1 then
+        local missing = self.exportPackageNextIndex or (self.exportPackageReceived + 1)
+        local received = self.exportPackageReceived or 0
+        self:resetExportPackageState()
+        setClippedLabel(self.exportTextStatusLabel, string.format("Local package incomplete: received %d/%d transfer parts; missing part %d.",
+            received, expected, missing), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        setClippedLabel(self.statusLabel, "Export package incomplete.", EXPORT_LEFT_TEXT_W, UIFont.Small)
+        return
+    end
+
+    local ok, err = pcall(function() self.exportPackageWriter:close() end)
+    self.exportPackageWriter = nil
+    if not ok then
+        self:resetExportPackageState()
+        setClippedLabel(self.exportTextStatusLabel, "Local package close failed: " .. tostring(err), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        setClippedLabel(self.statusLabel, "Export package close failed.", EXPORT_LEFT_TEXT_W, UIFont.Small)
+        return
+    end
+
+    local pending = self.pendingExportEntry or {}
+    local filename = safeTransferName(r.filename or pending.filename or self:getExportFilename())
+    local manifest = r.manifest or {}
+    manifest.name = filename
+    manifest.filename = filename
+    manifest.formatVersion = tonumber(manifest.formatVersion or manifest.format_version or 2) or 2
+    manifest.format_version = manifest.formatVersion
+    manifest.package = true
+    manifest.kind = "AreaExportPackage"
+    manifest.bytes = tonumber(r.bytes or manifest.bytes or self.exportPackageBytes or 0) or 0
+    manifest.tileCount = tonumber(r.tileCount or manifest.tileCount or 0) or 0
+    manifest.objectCount = tonumber(r.objectCount or manifest.objectCount or 0) or 0
+    manifest.visitedPositions = tonumber(r.visitedPositions or manifest.visitedPositions or 0) or 0
+    manifest.totalPositions = tonumber(r.totalPositions or manifest.totalPositions or 0) or 0
+    manifest.metadata = manifest.metadata or r.metadata or pending.metadata or {}
+    local center = manifest.metadata.center or {}
+    manifest.radius = tonumber(manifest.metadata.radius or manifest.radius or 0) or 0
+    manifest.centerX = tonumber(center.x or manifest.centerX or 0) or 0
+    manifest.centerY = tonumber(center.y or manifest.centerY or 0) or 0
+    manifest.createdAt = nowMs()
+
+    local manifestOk, manifestErr = writeClientTransferManifest(manifest)
+    local indexOk, indexErr = false, nil
+    if manifestOk then
+        indexOk, indexErr = upsertLocalExport(manifest)
+    end
+    if manifestOk and indexOk then
+        self.lastServerExportName = nil
+        self.pendingLocalExportName = nil
+        self:refreshLocalExports(filename)
+        setClippedLabel(self.exportTextStatusLabel, string.format("Saved %s: %d package tiles, %d transfer parts, %s.",
+            filename, manifest.tileCount or 0, expected, formatKb(manifest.bytes)), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        setClippedLabel(self.statusLabel, string.format("Exported %d package tiles locally.", manifest.tileCount or 0), EXPORT_LEFT_TEXT_W, UIFont.Small)
+    else
+        setClippedLabel(self.exportTextStatusLabel, "Package saved, but metadata failed: " .. tostring(manifestErr or indexErr), EXPORT_RIGHT_TEXT_W, UIFont.Small)
+        setClippedLabel(self.statusLabel, "Export metadata failed.", EXPORT_LEFT_TEXT_W, UIFont.Small)
+    end
+    self:resetExportPackageState()
 end
 
 function AE_MainDialog:onPickCenter()
@@ -1300,11 +1782,12 @@ function AE_MainDialog:onExport()
     local filename = self:getNewLocalExportFilename()
     self.pendingLocalExportName = filename
     self.lastServerExportName = nil
-    setClippedLabel(self.statusLabel, "Exporting on server...", EXPORT_LEFT_TEXT_W, UIFont.Small)
-    setClippedLabel(self.exportTextStatusLabel, "Writing JSON on source server...", EXPORT_RIGHT_TEXT_W, UIFont.Small)
+    self:resetExportPackageState()
+    setClippedLabel(self.statusLabel, "Starting streaming package export...", EXPORT_LEFT_TEXT_W, UIFont.Small)
+    setClippedLabel(self.exportTextStatusLabel, "Preparing local package writer...", EXPORT_RIGHT_TEXT_W, UIFont.Small)
 
     print("[AreaExport] requested export " .. tostring(filename))
-    sendClientCommand(getPlayer(), AE_Constants.MODULE, "export", {
+    sendClientCommand(getPlayer(), AE_Constants.MODULE, "exportPackage", {
         centerX = AE_Globals.pickedCenter.x,
         centerY = AE_Globals.pickedCenter.y,
         radius = radius,
@@ -1313,18 +1796,7 @@ function AE_MainDialog:onExport()
 end
 
 function AE_MainDialog:onLoadExportText()
-    -- Normal path uses the completed export name from this session. Crash
-    -- recovery deliberately falls back to the typed name so an admin can paste a
-    -- known server-side export name from the log and download it after reconnect.
-    local filename = self.lastServerExportName or self.pendingLocalExportName or safeTransferName(self:getExportFilename())
-    if not filename or filename == "" then
-        setClippedLabel(self.exportTextStatusLabel, "Enter an export name or run Export first.", EXPORT_RIGHT_TEXT_W, UIFont.Small)
-        return
-    end
-    setClippedLabel(self.exportTextStatusLabel, "Downloading server export " .. tostring(filename) .. "...", EXPORT_RIGHT_TEXT_W, UIFont.Small)
-    sendClientCommand(getPlayer(), AE_Constants.MODULE, "exportText", {
-        filename = filename,
-    })
+    setClippedLabel(self.exportTextStatusLabel, "Current exports are saved locally during Export automatically.", EXPORT_RIGHT_TEXT_W, UIFont.Small)
 end
 
 function AE_MainDialog:onImport()
@@ -1336,20 +1808,39 @@ function AE_MainDialog:onImport()
 end
 
 function AE_MainDialog:onImportPastedText()
-    local selectedName = self:getImportFilename()
-    local text = readClientTransferFile(self:getImportFilename())
-    if not text or text == "" then
-        setClippedLabel(self.pasteStatusLabel, "Selected export file is empty or missing.", IMPORT_RIGHT_TEXT_W, UIFont.Small)
-        setClippedLabel(self.importStatusLabel, "Import could not start.", IMPORT_LEFT_TEXT_W, UIFont.Small)
-        return
-    end
-
+    local selected = self:getSelectedLocalExport()
+    local selectedName = selected and selected.filename or self:getImportFilename()
     self.currentImportName = selectedName
     setClippedLabel(self.lastImportTitleLabel, "Last Import: running " .. tostring(selectedName), IMPORT_RIGHT_TEXT_W, UIFont.Small)
     self.importedSquaresValue:setName("0")
     self.failedSquaresValue:setName("0")
     self.addedItemsValue:setName("0 / 0")
     self.missingContainersValue:setName("0")
+
+    if selected and selected.package then
+        local ok, err = self:startPackageTransfer("importPackage", selected)
+        if ok then
+            setClippedLabel(self.importStatusLabel, "Importing selected package...", IMPORT_LEFT_TEXT_W, UIFont.Small)
+            return
+        end
+        setClippedLabel(self.pasteStatusLabel, "Import could not start: " .. tostring(err), IMPORT_RIGHT_TEXT_W, UIFont.Small)
+        setClippedLabel(self.importStatusLabel, "Import could not start.", IMPORT_LEFT_TEXT_W, UIFont.Small)
+        return
+    end
+
+    if selected and (selected.bytes or 0) > LEGACY_LARGE_FILE_LIMIT then
+        setClippedLabel(self.pasteStatusLabel, "Legacy JSON is too large. Re-export with the current package format.", IMPORT_RIGHT_TEXT_W, UIFont.Small)
+        setClippedLabel(self.importStatusLabel, "Import refused to protect the client heap.", IMPORT_LEFT_TEXT_W, UIFont.Small)
+        return
+    end
+
+    local text = readClientTransferFile(selectedName)
+    if not text or text == "" then
+        setClippedLabel(self.pasteStatusLabel, "Selected export file is empty or missing.", IMPORT_RIGHT_TEXT_W, UIFont.Small)
+        setClippedLabel(self.importStatusLabel, "Import could not start.", IMPORT_LEFT_TEXT_W, UIFont.Small)
+        return
+    end
+
     local chunks = splitChunks(text, JSON_CHUNK_SIZE)
     setClippedLabel(self.pasteStatusLabel, string.format("Import upload: 0/%d chunks queued.", #chunks), IMPORT_RIGHT_TEXT_W, UIFont.Small)
     setClippedLabel(self.importStatusLabel, "Importing selected local export...", IMPORT_LEFT_TEXT_W, UIFont.Small)
@@ -1447,8 +1938,9 @@ function AE_MainDialog:updateActiveTransfers()
 end
 
 function AE_MainDialog:processOutboundTransfers()
-    -- Send only a small batch per render/update cycle. This keeps the game UI
-    -- responsive while moving multi-megabyte JSON exports back to the server.
+    -- Legacy v1 JSON support. The public package workflow uses
+    -- processPackageTransfers below so large exports are never split from a
+    -- preloaded client string.
     if not self.outboundTextTransfers then return end
     for prefix, transfer in pairs(self.outboundTextTransfers) do
         if transfer and not transfer.finishSent then
@@ -1542,6 +2034,249 @@ function AE_MainDialog:sendChunkedTextCommand(prefix, text)
     })
 end
 
+function AE_MainDialog:getPackageTransferLabel(prefix)
+    if prefix == "validatePackage" then return self.validateStatusLabel, VALIDATE_STATUS_W end
+    if prefix == "importPackage" then return self.pasteStatusLabel or self.importStatusLabel, IMPORT_RIGHT_TEXT_W end
+    return nil, 500
+end
+
+function AE_MainDialog:getPackageTransferName(prefix)
+    if prefix == "validatePackage" then return "Dry Run" end
+    if prefix == "importPackage" then return "Import" end
+    return "Package"
+end
+
+function AE_MainDialog:setPackageTransferStatus(prefix, message)
+    local label, maxWidth = self:getPackageTransferLabel(prefix)
+    if label then setClippedLabel(label, message, maxWidth or 500, UIFont.Small) end
+end
+
+function AE_MainDialog:finishPackageTransfer(prefix)
+    if not self.packageTransfers then return end
+    local state = self.packageTransfers[prefix]
+    if state and state.reader then pcall(function() state.reader:close() end) end
+    self.packageTransfers[prefix] = nil
+end
+
+function AE_MainDialog:getPackageTransferPercent(prefix)
+    local state = self.packageTransfers and self.packageTransfers[prefix]
+    if not state then return 0 end
+    if state.phase == "clearing" then
+        local total = tonumber(state.clearTotal or 0) or 0
+        if total > 0 then return clampPercent(((tonumber(state.clearVisited or 0) or 0) * 100) / total) end
+    elseif state.phase == "importing" then
+        local total = tonumber(state.totalLines or 0) or 0
+        if total > 0 then return clampPercent(((tonumber(state.importedLines or 0) or 0) * 100) / total) end
+    else
+        local total = tonumber(state.totalLines or 0) or 0
+        if total > 0 then return clampPercent(((tonumber(state.confirmedLines or 0) or 0) * 100) / total) end
+    end
+    if state.progressPercent then return clampPercent(state.progressPercent) end
+    return 0
+end
+
+function AE_MainDialog:updatePackageTransferStatus(prefix, force)
+    local state = self.packageTransfers and self.packageTransfers[prefix]
+    if not state then return end
+    local now = nowMs()
+    if not force and state.lastStatusAt and now - state.lastStatusAt < 900 then return end
+    state.lastStatusAt = now
+
+    local elapsed = elapsedSeconds(state.startedAt)
+    local name = self:getPackageTransferName(prefix)
+    local totalLines = tonumber(state.totalLines or 0) or 0
+    local percent = self:getPackageTransferPercent(prefix)
+    if state.phase == "starting" then
+        self:setPackageTransferStatus(prefix, string.format("%s: opening package session (%ds).", name, elapsed))
+    elseif state.phase == "clearing" then
+        self:setPackageTransferStatus(prefix, string.format("%s clearing target: %d/%d positions (%d%%, %ds).",
+            name, state.clearVisited or 0, state.clearTotal or 0, percent, elapsed))
+    elseif state.phase == "importing" then
+        self:setPackageTransferStatus(prefix, string.format("%s rebuild: %d/%d package tiles (%d%%, %ds).",
+            name, state.importedLines or state.confirmedLines or 0, totalLines, percent, elapsed))
+    elseif state.phase == "waiting" then
+        self:setPackageTransferStatus(prefix, string.format("%s: waiting for server result after %d/%d package tiles (%ds).",
+            name, state.confirmedLines or 0, totalLines, elapsed))
+    elseif prefix == "validatePackage" then
+        self:setPackageTransferStatus(prefix, string.format("%s scan: %d/%d package tiles checked in %d transfer parts (%d%%, %ds).",
+            name, state.confirmedLines or 0, totalLines, state.confirmedChunks or 0, percent, elapsed))
+    else
+        self:setPackageTransferStatus(prefix, string.format("%s upload: %d/%d package tiles in %d transfer parts (%d%%, %ds).",
+            name, state.confirmedLines or 0, totalLines, state.confirmedChunks or 0, percent, elapsed))
+    end
+end
+
+function AE_MainDialog:startPackageTransfer(prefix, selected)
+    selected = selected or self:getSelectedLocalExport()
+    if not selected or not selected.package then return false, "selected export is not a package" end
+
+    local manifestText = readClientFile(clientTransferManifestPath(selected.filename))
+    if not manifestText or manifestText == "" then
+        manifestText = AE_Json.encode(normalizeExportEntry(selected))
+    end
+    local ok, readerOrErr = pcall(function()
+        return getFileReader(clientTransferTilesPath(selected.filename), false)
+    end)
+    if not ok or not readerOrErr then
+        return false, "could not open package tile file"
+    end
+
+    local sessionId = tostring(nowMs()) .. "-" .. tostring(ZombRand and ZombRand(1000000) or math.random(1000000))
+    self.packageTransfers = self.packageTransfers or {}
+    self.packageTransfers[prefix] = {
+        sessionId = sessionId,
+        reader = readerOrErr,
+        phase = "starting",
+        selectedName = selected.filename,
+        sentChunks = 0,
+        confirmedChunks = 0,
+        sentLines = 0,
+        confirmedLines = 0,
+        importedLines = 0,
+        totalLines = tonumber(selected.tileCount or selected.tiles or 0) or 0,
+        progressPercent = 0,
+        pendingLine = nil,
+        pendingPayload = "",
+        waitingChunk = false,
+        finishSent = false,
+        startedAt = nowMs(),
+        lastStatusAt = 0,
+    }
+    self:updatePackageTransferStatus(prefix, true)
+    sendClientCommand(getPlayer(), AE_Constants.MODULE, prefix .. "Start", {
+        sessionId = sessionId,
+        manifestJson = manifestText,
+        rulesJson = self:getRulesJson(),
+    })
+    return true
+end
+
+function AE_MainDialog:processPackageTransfers()
+    if not self.packageTransfers then return end
+    for prefix, state in pairs(self.packageTransfers) do
+        if state then
+            self:updatePackageTransferStatus(prefix, false)
+            if state.phase == "upload" and not state.waitingChunk and not state.finishSent then
+                local payload = tostring(state.pendingPayload or "")
+                state.pendingPayload = ""
+                local readOk, readErr = true, nil
+                if payload == "" then
+                    for _ = 1, PACKAGE_LINES_PER_UPDATE do
+                        local line = state.pendingLine
+                        state.pendingLine = nil
+                        if line == nil then
+                            local ok, readLine = pcall(function() return state.reader:readLine() end)
+                            if not ok then
+                                readOk = false
+                                readErr = readLine
+                                break
+                            end
+                            line = readLine
+                        end
+                        if not line then break end
+                        if line ~= "" then
+                            payload = payload .. line .. "\n"
+                            state.sentLines = (state.sentLines or 0) + 1
+                            if #payload >= PACKAGE_CHUNK_BYTE_TARGET then break end
+                        end
+                    end
+                end
+
+                if not readOk then
+                    self:setPackageTransferStatus(prefix, self:getPackageTransferName(prefix) .. " failed while reading package: " .. tostring(readErr))
+                    self:finishPackageTransfer(prefix)
+                elseif payload ~= "" then
+                    local chunk = payload
+                    if #chunk > PACKAGE_CHUNK_BYTE_TARGET then
+                        chunk = string.sub(payload, 1, PACKAGE_CHUNK_BYTE_TARGET)
+                        state.pendingPayload = string.sub(payload, PACKAGE_CHUNK_BYTE_TARGET + 1)
+                    end
+                    state.sentChunks = (state.sentChunks or 0) + 1
+                    state.waitingChunk = true
+                    sendClientCommand(getPlayer(), AE_Constants.MODULE, prefix .. "Chunk", {
+                        sessionId = state.sessionId,
+                        index = state.sentChunks,
+                        chunk = chunk,
+                    })
+                else
+                    state.finishSent = true
+                    state.phase = "waiting"
+                    pcall(function() state.reader:close() end)
+                    state.reader = nil
+                    self:updatePackageTransferStatus(prefix, true)
+                    sendClientCommand(getPlayer(), AE_Constants.MODULE, prefix .. "Finish", {
+                        sessionId = state.sessionId,
+                    })
+                end
+            end
+        end
+    end
+end
+
+function AE_MainDialog:onPackageTransferStart(prefix, r)
+    local state = self.packageTransfers and self.packageTransfers[prefix]
+    if not r.success then
+        self:setPackageTransferStatus(prefix, self:getPackageTransferName(prefix) .. " failed to start: " .. tostring(r.error or "unknown"))
+        self:finishPackageTransfer(prefix)
+        return
+    end
+    if not state then return end
+    if prefix == "importPackage" and r.phase == "clearing" then
+        state.phase = "clearing"
+    else
+        state.phase = "upload"
+    end
+    if r.totalLines then state.totalLines = tonumber(r.totalLines) or state.totalLines end
+    state.progressPercent = tonumber(r.progressPercent or state.progressPercent or 0) or 0
+    self:updatePackageTransferStatus(prefix, true)
+end
+
+function AE_MainDialog:onImportPackageReady(r)
+    local state = self.packageTransfers and self.packageTransfers.importPackage
+    if not r.success then
+        self:setPackageTransferStatus("importPackage", "Import failed while clearing footprint: " .. tostring(r.error or "unknown"))
+        self:finishPackageTransfer("importPackage")
+        return
+    end
+    if not state or state.sessionId ~= r.sessionId then return end
+    state.phase = "upload"
+    self:updatePackageTransferStatus("importPackage", true)
+end
+
+function AE_MainDialog:onImportPackageProgress(r)
+    local state = self.packageTransfers and self.packageTransfers.importPackage
+    if not r.success then
+        self:setPackageTransferStatus("importPackage", "Import failed while processing package: " .. tostring(r.error or "unknown"))
+        self:finishPackageTransfer("importPackage")
+        return
+    end
+    if not state or state.sessionId ~= r.sessionId then return end
+    state.phase = r.phase or state.phase
+    state.clearVisited = tonumber(r.clearVisited or state.clearVisited or 0) or 0
+    state.clearTotal = tonumber(r.clearTotal or state.clearTotal or 0) or 0
+    state.importedLines = tonumber(r.importedLines or r.lines or state.importedLines or 0) or 0
+    state.totalLines = tonumber(r.totalLines or state.totalLines or 0) or 0
+    state.progressPercent = tonumber(r.progressPercent or state.progressPercent or 0) or 0
+    self:updatePackageTransferStatus("importPackage", true)
+end
+
+function AE_MainDialog:onPackageTransferChunk(prefix, r)
+    local state = self.packageTransfers and self.packageTransfers[prefix]
+    if not r.success then
+        self:setPackageTransferStatus(prefix, self:getPackageTransferName(prefix) .. " upload failed: " .. tostring(r.error or "unknown"))
+        self:finishPackageTransfer(prefix)
+        return
+    end
+    if not state or state.sessionId ~= r.sessionId then return end
+    state.confirmedChunks = math.max(state.confirmedChunks or 0, tonumber(r.index or 0) or 0)
+    state.confirmedLines = tonumber(r.lines or state.confirmedLines or 0) or 0
+    if r.totalLines then state.totalLines = tonumber(r.totalLines) or state.totalLines end
+    state.progressPercent = tonumber(r.progressPercent or state.progressPercent or 0) or 0
+    state.waitingChunk = false
+    state.phase = "upload"
+    self:updatePackageTransferStatus(prefix, true)
+end
+
 function AE_MainDialog:getSelectedReplacementType()
     local typed = self.replacementSearchBox and self.replacementSearchBox:getText() or ""
     if self.selectedConflict and self.selectedConflict.kind ~= "Item" and typed and typed ~= "" then return typed end
@@ -1563,6 +2298,7 @@ function AE_MainDialog:updateRuleButtons(action)
     end
     setButtonState(self.addActionSkip, "danger", action == "Skip")
     setButtonState(self.addActionReplace, "warning", action == "Replace")
+    setButtonState(self.addActionOriginal, nil, action == "Use Original")
     setButtonState(self.addActionPlaceholder, nil, action == "Placeholder")
 end
 
@@ -1577,12 +2313,24 @@ function AE_MainDialog:updateSelectedConflictPanel(row)
         end
         setClippedLabel(self.selectedActionLabel, text, VALIDATE_RULE_W, UIFont.Small)
     end
+    if self.selectedReasonLabel then
+        setClippedLabel(self.selectedReasonLabel, row.message or "Review this conflict before importing.", VALIDATE_RULE_W, UIFont.Small)
+    end
     self:updateRuleButtons(row.action or "Review")
+end
+
+function AE_MainDialog:forgetRule(row)
+    local key = conflictRuleKey(row)
+    if key and self.mappingRules then self.mappingRules[key] = nil end
 end
 
 function AE_MainDialog:rememberRule(row)
     local key = conflictRuleKey(row)
     if not key then return end
+    if row.action == "Use Original" or row.action == "Review" then
+        self:forgetRule(row)
+        return
+    end
     self.mappingRules[key] = {
         kind = row.kind,
         id = row.id,
@@ -1605,6 +2353,10 @@ function AE_MainDialog:applyRuleToSelected(action)
         setClippedLabel(self.validateStatusLabel, "Placeholders are only available for item conflicts.", VALIDATE_STATUS_W, UIFont.Small)
         return
     end
+    if action == "Use Original" and row.kind ~= "Sprite" then
+        setClippedLabel(self.validateStatusLabel, "Use Original is only available for sprite lookup warnings.", VALIDATE_STATUS_W, UIFont.Small)
+        return
+    end
 
     row.action = action
     if action == "Replace" then
@@ -1613,7 +2365,11 @@ function AE_MainDialog:applyRuleToSelected(action)
         row.replacement = nil
     end
 
-    self:rememberRule(row)
+    if action == "Use Original" then
+        self:forgetRule(row)
+    else
+        self:rememberRule(row)
+    end
     self:updateSelectedConflictPanel(row)
     local detail = row.action
     if row.replacement then detail = detail .. " -> " .. tostring(row.replacement) end
@@ -1623,6 +2379,19 @@ end
 function AE_MainDialog:onValidate()
     self:setActiveTab("validate")
     setClippedLabel(self.validateStatusLabel, "Running Dry Run...", VALIDATE_STATUS_W, UIFont.Small)
+
+    local selected = self:getSelectedLocalExport()
+    if selected and selected.package then
+        local ok, err = self:startPackageTransfer("validatePackage", selected)
+        if ok then return end
+        setClippedLabel(self.validateStatusLabel, "Dry Run could not start: " .. tostring(err), VALIDATE_STATUS_W, UIFont.Small)
+        return
+    end
+
+    if selected and (selected.bytes or 0) > LEGACY_LARGE_FILE_LIMIT then
+        setClippedLabel(self.validateStatusLabel, "Legacy JSON is too large. Re-export with the current package format.", VALIDATE_STATUS_W, UIFont.Small)
+        return
+    end
 
     local text = readClientTransferFile(self:getImportFilename())
     if text and text ~= "" then

@@ -19,10 +19,13 @@ local function getDialog()
 end
 
 local function parseResult(args)
-    -- Every server response is JSON encoded to keep command payloads uniform and
-    -- to avoid depending on how Project Zomboid serializes nested Lua tables.
-    if not args or not args.json then
+    -- Most responses are JSON encoded. Large package chunks are sent as raw
+    -- fields so tile JSON does not get escaped into a much larger JSON string.
+    if not args then
         return { success = false, error = "empty response" }
+    end
+    if not args.json then
+        return args
     end
     local parsed, err = AE_Json.decode(args.json)
     if not parsed then
@@ -46,9 +49,9 @@ local function handleScan(r)
         return
     end
     local s = string.format(
-        "Squares: %d  Objects: %d  Container: %d  Items(world): %d  PB: %d  Items(in): %d",
+        "Map tiles: %d  Map objects: %d  Containers: %d  Container items: %d  Loose floor items: %d  Player-built: %d",
         r.squareCount or 0, r.objectCount or 0, r.containerCount or 0,
-        r.worldItemCount or 0, r.playerBuildCount or 0, r.totalItemsInContainers or 0)
+        r.totalItemsInContainers or 0, r.worldItemCount or 0, r.playerBuildCount or 0)
     if dlg.statsLabel and not dlg.setScanResult then
         dlg.statsLabel:setName(s)
     elseif dlg.statsLabel then
@@ -113,6 +116,26 @@ local function handleExportTextDone(r)
     if dlg.finishExportText then dlg:finishExportText(r) end
 end
 
+local function handleExportPackageStart(r)
+    local dlg = getDialog(); if not dlg then return end
+    if dlg.startExportPackage then dlg:startExportPackage(r) end
+end
+
+local function handleExportPackageChunk(r)
+    local dlg = getDialog(); if not dlg then return end
+    if dlg.addExportPackageChunk then dlg:addExportPackageChunk(r) end
+end
+
+local function handleExportPackageProgress(r)
+    local dlg = getDialog(); if not dlg then return end
+    if dlg.updateExportPackageProgress then dlg:updateExportPackageProgress(r) end
+end
+
+local function handleExportPackageDone(r)
+    local dlg = getDialog(); if not dlg then return end
+    if dlg.finishExportPackage then dlg:finishExportPackage(r) end
+end
+
 local function handleListFiles(r)
     local dlg = getDialog(); if not dlg then return end
     if not r.success then
@@ -136,6 +159,26 @@ end
 local function handleTextTransferChunk(prefix, r)
     local dlg = getDialog(); if not dlg then return end
     if dlg.onTextTransferChunk then dlg:onTextTransferChunk(prefix, r) end
+end
+
+local function handlePackageTransferStart(prefix, r)
+    local dlg = getDialog(); if not dlg then return end
+    if dlg.onPackageTransferStart then dlg:onPackageTransferStart(prefix, r) end
+end
+
+local function handlePackageTransferChunk(prefix, r)
+    local dlg = getDialog(); if not dlg then return end
+    if dlg.onPackageTransferChunk then dlg:onPackageTransferChunk(prefix, r) end
+end
+
+local function handleImportPackageReady(r)
+    local dlg = getDialog(); if not dlg then return end
+    if dlg.onImportPackageReady then dlg:onImportPackageReady(r) end
+end
+
+local function handleImportPackageProgress(r)
+    local dlg = getDialog(); if not dlg then return end
+    if dlg.onImportPackageProgress then dlg:onImportPackageProgress(r) end
 end
 
 local function handleSearchItems(r)
@@ -163,11 +206,23 @@ local function onServerCommand(module, command, args)
     elseif command == "exportTextStartResult" then handleExportTextStart(r)
     elseif command == "exportTextChunkResult" then handleExportTextChunk(r)
     elseif command == "exportTextDoneResult" then handleExportTextDone(r)
+    elseif command == "exportPackageStartResult" then handleExportPackageStart(r)
+    elseif command == "exportPackageChunkResult" then handleExportPackageChunk(r)
+    elseif command == "exportPackageProgressResult" then handleExportPackageProgress(r)
+    elseif command == "exportPackageDoneResult" then handleExportPackageDone(r)
     elseif command == "listFilesResult" then handleListFiles(r)
     elseif command == "validateResult" then handleValidate(r)
     elseif command == "validateTextStartResult" then handleTextTransferStart("validateText", r)
     elseif command == "validateTextChunkResult" then handleTextTransferChunk("validateText", r)
     elseif command == "validateTextFinishResult" then handleValidate(r)
+    elseif command == "validatePackageStartResult" then handlePackageTransferStart("validatePackage", r)
+    elseif command == "validatePackageChunkResult" then handlePackageTransferChunk("validatePackage", r)
+    elseif command == "validatePackageFinishResult" then handleValidate(r)
+    elseif command == "importPackageStartResult" then handlePackageTransferStart("importPackage", r)
+    elseif command == "importPackageReadyResult" then handleImportPackageReady(r)
+    elseif command == "importPackageProgressResult" then handleImportPackageProgress(r)
+    elseif command == "importPackageChunkResult" then handlePackageTransferChunk("importPackage", r)
+    elseif command == "importPackageFinishResult" then handleImport(r)
     elseif command == "searchItemsResult" then handleSearchItems(r)
     elseif command == "reconcileWorldItemSquareResult" then handleWorldItemReconcile(r)
     elseif command == "reconcileworlditemsquareResult" then handleWorldItemReconcile(r)

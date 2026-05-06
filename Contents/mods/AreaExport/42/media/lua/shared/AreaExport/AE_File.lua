@@ -6,8 +6,9 @@
     Layout: <Zomboid>/Lua/AreaExport/<filename>.json
 
     Note: this is the older server-side file path. The public workflow now streams
-    exports into client-local AreaExportClient/*.json from AE_MainDialog.lua, but
-    these helpers are kept for compatibility with command/file based imports.
+    package tiles into client-local AreaExportClient/*.tiles.jsonl plus a small
+    *.manifest.json from AE_MainDialog.lua. These helpers remain only for legacy
+    compatibility and small internal server buffers.
 ]]
 
 local AE_Sa = require("AreaExport/AE_SafeAccess")

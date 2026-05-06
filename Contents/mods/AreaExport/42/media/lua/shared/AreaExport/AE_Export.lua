@@ -24,6 +24,18 @@ local AE_File     = require("AreaExport/AE_File")
 local AE_Export = {}
 
 local FORMAT_VERSION = 1
+local STREAM_FORMAT_VERSION = 2
+
+local function countFootprintPositions(radius)
+    local count = 0
+    local r2 = radius * radius
+    for dy = -radius, radius do
+        for dx = -radius, radius do
+            if dx * dx + dy * dy <= r2 then count = count + 1 end
+        end
+    end
+    return count * 8
+end
 
 local function serializeAttrs(target, attrs)
     local data = {}
@@ -207,6 +219,104 @@ function AE_Export.build(centerX, centerY, radius)
         tileCount = #tiles,
         objectCount = objCount,
         metadata = metadata,
+    }
+end
+
+function AE_Export.startStream(centerX, centerY, radius)
+    AE_Sa.reset()
+    local cell = getCell()
+    if not cell then return nil, "no cell loaded" end
+
+    radius = math.floor(tonumber(radius or 0) or 0)
+    local metadata = {
+        exported_at = getTimestampMs and getTimestampMs() or 0,
+        exporter_version = "1.0.0",
+        center = { x = centerX, y = centerY },
+        radius = radius,
+    }
+
+    return {
+        cell = cell,
+        centerX = centerX,
+        centerY = centerY,
+        radius = radius,
+        r2 = radius * radius,
+        dx = -radius,
+        dy = -radius,
+        z = 0,
+        done = false,
+        tileCount = 0,
+        objectCount = 0,
+        visitedPositions = 0,
+        totalPositions = countFootprintPositions(radius),
+        bytes = 0,
+        metadata = metadata,
+        format_version = STREAM_FORMAT_VERSION,
+    }
+end
+
+local function advanceStreamCursor(state)
+    state.z = (state.z or 0) + 1
+    if state.z <= 7 then return end
+    state.z = 0
+    state.dx = (state.dx or -state.radius) + 1
+    if state.dx <= state.radius then return end
+    state.dx = -state.radius
+    state.dy = (state.dy or -state.radius) + 1
+    if state.dy > state.radius then state.done = true end
+end
+
+function AE_Export.nextStreamLines(state, maxLines, maxBytes, maxVisited)
+    if not state or state.done then return {}, true end
+    maxLines = math.max(1, tonumber(maxLines or 100) or 100)
+    maxBytes = math.max(1024, tonumber(maxBytes or 65536) or 65536)
+    maxVisited = math.max(64, tonumber(maxVisited or 2000) or 2000)
+    local lines = {}
+    local bytes = 0
+    local visited = 0
+
+    while not state.done and #lines < maxLines and visited < maxVisited do
+        local dx, dy, z = state.dx, state.dy, state.z
+        visited = visited + 1
+        if dx * dx + dy * dy <= state.r2 then
+            local sq = state.cell:getGridSquare(state.centerX + dx, state.centerY + dy, z)
+            if sq then
+                local t = serializeTile(sq)
+                if t.floor_sprite or t.objects or t.worldItems or (t.z > 0 and t.hasFloor == false) then
+                    local line = AE_Json.encode(t)
+                    if #lines > 0 and bytes + #line > maxBytes then
+                        return lines, false
+                    end
+                    lines[#lines + 1] = line
+                    bytes = bytes + #line + 1
+                    state.tileCount = state.tileCount + 1
+                    state.objectCount = state.objectCount + (t.objects and #t.objects or 0)
+                    state.bytes = state.bytes + #line + 1
+                end
+            end
+            state.visitedPositions = (state.visitedPositions or 0) + 1
+        end
+        advanceStreamCursor(state)
+    end
+
+    return lines, state.done
+end
+
+function AE_Export.streamManifest(state, filename)
+    return {
+        format_version = STREAM_FORMAT_VERSION,
+        kind = "AreaExportPackage",
+        filename = filename,
+        metadata = state and state.metadata or {},
+        tileCount = state and state.tileCount or 0,
+        objectCount = state and state.objectCount or 0,
+        visitedPositions = state and state.visitedPositions or 0,
+        totalPositions = state and state.totalPositions or 0,
+        bytes = state and state.bytes or 0,
+        files = {
+            tiles = tostring(filename or "export") .. ".tiles.jsonl",
+            manifest = tostring(filename or "export") .. ".manifest.json",
+        },
     }
 end
 

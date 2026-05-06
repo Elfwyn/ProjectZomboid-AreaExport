@@ -1,6 +1,6 @@
 name=Area Export
 id=AreaExport
-description=Admin migration tool for Project Zomboid Build 42. Export a circular area and import it at the original world coordinates in another save or server.
+description=Alpha admin migration tool for Project Zomboid Build 42. Export a circular area and import it at the original world coordinates in another save or server. Back up saves before use.
 author=Area Export contributors
 version=1.0.0
 poster=poster.png
