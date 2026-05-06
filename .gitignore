@@ -1,0 +1,13 @@
+.gradle/
+build/
+bin/
+.env
+.env.*
+*.key
+id_rsa
+id_ed25519
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
